@@ -1,0 +1,99 @@
+@import url('https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;500;600;700;800;900&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html, body {
+    background-color: #ffffff;
+    color: #0f172a;
+    font-family: 'Poppins', sans-serif;
+    margin: 0;
+    padding: 0;
+    width: 100%;
+    min-height: 100vh;
+  }
+
+  body {
+    overflow-x: hidden;
+  }
+  
+  /* Scrollbars matching light theme */
+  ::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+  ::-webkit-scrollbar-track {
+    background: #ffffff;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: #e2e8f0;
+    border-radius: 4px;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: #e30613;
+  }
+}
+
+/* Custom Sports and Athletic Classes */
+.glow-red {
+  box-shadow: 0 0 25px rgba(227, 6, 19, 0.2);
+}
+
+.glow-dark {
+  box-shadow: 0 4px 20px rgba(15, 23, 42, 0.08);
+}
+
+/* Glassmorphism custom classes replaced by Premium Solid light surfaces */
+.glass {
+  background: rgba(255, 255, 255, 0.95);
+  border: 1px solid #e2e8f0;
+}
+
+.glass-light {
+  background: rgba(255, 255, 255, 0.85);
+  border: 1px solid #f1f5f9;
+}
+
+.ticket-border {
+  border: 1px solid #e2e8f0;
+}
+
+.ticket-shadow {
+  box-shadow: 0 4px 24px rgba(15, 23, 42, 0.06);
+}
+
+/* Diagonal Sold Out Stripes for light theme */
+.booked-stripes {
+  background-image: repeating-linear-gradient(
+    45deg,
+    rgba(227, 6, 19, 0.02),
+    rgba(227, 6, 19, 0.02) 10px,
+    rgba(241, 245, 249, 0.7) 10px,
+    rgba(241, 245, 249, 0.7) 20px
+  );
+}
+
+/* Custom keyframes for fade effects */
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.animate-fadeIn {
+  animation: fadeIn 0.4s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+/* Slider transition classes */
+.slide-active {
+  opacity: 1;
+  transform: scale(1);
+  transition: opacity 1s ease-in-out, transform 10s ease-out;
+}
+
+.slide-inactive {
+  opacity: 0;
+  transform: scale(1.05);
+  transition: opacity 1s ease-in-out;
+}
