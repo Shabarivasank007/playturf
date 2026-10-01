@@ -42,9 +42,10 @@ export const CinematicIntro = ({ onComplete }) => {
     return () => clearTimeout(timer);
   }, []);
 
-  // When scroll reaches 95%, auto-trigger completion
+  // When scroll reaches 96%, auto-trigger completion
+  // framer-motion v11+: use .on() instead of deprecated .onChange()
   useEffect(() => {
-    const unsubscribe = scrollYProgress.onChange((latest) => {
+    const unsubscribe = scrollYProgress.on('change', (latest) => {
       if (latest >= 0.96) {
         onComplete();
       }

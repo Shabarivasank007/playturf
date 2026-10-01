@@ -1,537 +1,722 @@
-import React, { useState, useEffect } from 'react';
-import { useApp } from '../context/AppContext';
+import { useState, useEffect, useCallback, useRef } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { motion, AnimatePresence } from 'framer-motion';
-import { Calendar, Clock, HelpCircle, AlertCircle, X, Check, Timer, MessageSquare, ArrowRight, Zap, MapPin } from 'lucide-react';
+import {
+  Calendar, Clock, Timer, CheckCircle,
+  CreditCard, Smartphone, Shield, X, AlertCircle, ChevronDown
+} from 'lucide-react';
+import { useApp } from '../context/AppContext';
+import { fetchSlots } from '../api/slots';
+import { createBooking, confirmPayment } from '../api/bookings';
+import { useSlotSocket } from '../hooks/useSlotSocket';
 
-export default function Book() {
-  const {
-    dates,
-    slots,
-    selectedDate,
-    setSelectedDate,
-    activeHeldSlot,
-    holdTimer,
-    holdSlot,
-    releaseHeldSlot,
-    confirmBooking,
-    user
-  } = useApp();
+// ── Helpers ───────────────────────────────────────────────────────────────────
+const todayStr = () => new Date().toISOString().split('T')[0];
 
-  const [bookingSlotId, setBookingSlotId] = useState(null);
-  const [duration, setDuration] = useState(1); // 1h, 1.5h, 2h
-  const [bookingSuccess, setBookingSuccess] = useState(false);
-  const [lastBookingId, setLastBookingId] = useState('');
-  
-  // Tactical Pitch Selector state: 'pitchA' (5v5) vs 'pitchB' (7v7)
-  const [selectedPitch, setSelectedPitch] = useState('pitchA');
-
-  // Selected date's slots
-  const baseSlots = slots[selectedDate] || [];
-  
-  // Dynamically adjust price and pitch configurations based on selected pitch
-  const activeSlots = baseSlots.map(slot => {
-    const rateMultiplier = selectedPitch === 'pitchB' ? 1.28 : 1; // 7v7 rates are higher
-    return {
-      ...slot,
-      price: Math.round(slot.price * rateMultiplier)
-    };
+const getDates = (n = 7) =>
+  Array.from({ length: n }, (_, i) => {
+    const d = new Date();
+    d.setDate(d.getDate() + i);
+    return d.toISOString().split('T')[0];
   });
 
-  // Reset local modal state when hold releases from context
+// "15:00:00" → "3:00 PM"
+const fmtTime = (t) => {
+  if (!t) return '';
+  const h = parseInt(t.split(':')[0], 10);
+  return `${h === 0 ? 12 : h > 12 ? h - 12 : h}:00 ${h < 12 ? 'AM' : 'PM'}`;
+};
+
+// integer hour → label "3:00 PM"
+const hourLabel = (h) => {
+  if (h === 0)  return '12:00 AM';
+  if (h === 12) return '12:00 PM';
+  if (h === 24) return '12:00 AM (next)';
+  return h < 12 ? `${h}:00 AM` : `${h - 12}:00 PM`;
+};
+
+const STATUS_CONFIG = {
+  AVAILABLE: { bg: 'bg-emerald-50',  border: 'border-emerald-200', dot: 'bg-emerald-400', text: 'text-emerald-700', label: 'Available' },
+  HELD:      { bg: 'bg-amber-50',    border: 'border-amber-200',   dot: 'bg-amber-400',   text: 'text-amber-600',  label: 'Held'      },
+  BOOKED:    { bg: 'bg-red-50',      border: 'border-red-200',     dot: 'bg-red-400',     text: 'text-red-600',    label: 'Booked'    },
+  BLOCKED:   { bg: 'bg-slate-100',   border: 'border-slate-200',   dot: 'bg-slate-400',   text: 'text-slate-500',  label: 'Blocked'   },
+};
+
+const HOLD_SECS = 300;
+
+export default function Book() {
+  const { user, showToast } = useApp();
+  const navigate = useNavigate();
+
+  // ── Grid state ────────────────────────────────────────────────────────────
+  const [gridDate, setGridDate]           = useState(todayStr());
+  const [slots, setSlots]                 = useState([]);
+  const [loadingSlots, setLoadingSlots]   = useState(false);
+
+  // ── Modal state ───────────────────────────────────────────────────────────
+  const [showModal, setShowModal]   = useState(false);
+  const [step, setStep]             = useState('form'); // form | payment | success
+
+  // ── Form ──────────────────────────────────────────────────────────────────
+  const [form, setForm] = useState({
+    date:       todayStr(),
+    startHour:  '',   // 0-23
+    endHour:    '',   // 1-24 (exclusive)
+    teamName:   '',
+    numPlayers: '',
+  });
+  const [formErrors, setFormErrors] = useState({});
+  const [submitting, setSubmitting] = useState(false);
+
+  // ── Booking + hold ────────────────────────────────────────────────────────
+  const [pendingBooking, setPending]  = useState(null);
+  const [holdTimer, setHoldTimer]     = useState(HOLD_SECS);
+  const timerRef = useRef(null);
+
+  // ── Payment ───────────────────────────────────────────────────────────────
+  const [payMethod, setPayMethod]   = useState('upi');
+  const [payLoading, setPayLoading] = useState(false);
+
+  // ── Load slots ────────────────────────────────────────────────────────────
+  const loadSlots = useCallback(async () => {
+    setLoadingSlots(true);
+    try { setSlots(await fetchSlots(gridDate)); }
+    catch { showToast('Could not load slot grid', 'warning'); }
+    finally { setLoadingSlots(false); }
+  }, [gridDate]);
+
+  useEffect(() => { loadSlots(); }, [loadSlots]);
+
+  // ── WebSocket live updates ────────────────────────────────────────────────
+  useSlotSocket(gridDate, (updated) => {
+    setSlots((prev) => prev.map((s) => s.id === updated.id ? updated : s));
+  });
+
+  // ── Hold countdown ────────────────────────────────────────────────────────
   useEffect(() => {
-    if (!activeHeldSlot) {
-      setBookingSlotId(null);
-    }
-  }, [activeHeldSlot]);
+    if (!pendingBooking || step !== 'payment') return;
+    clearInterval(timerRef.current);
+    timerRef.current = setInterval(() => {
+      setHoldTimer((t) => {
+        if (t <= 1) {
+          clearInterval(timerRef.current);
+          showToast('Hold expired — please book again', 'warning');
+          closeModal();
+          return 0;
+        }
+        return t - 1;
+      });
+    }, 1000);
+    return () => clearInterval(timerRef.current);
+  }, [pendingBooking, step]);
 
-  const handleSlotClick = (slot) => {
-    if (slot.status === 'available') {
-      holdSlot(selectedDate, slot.id);
-      setBookingSlotId(slot.id);
-      setDuration(1);
-      setBookingSuccess(false);
-    }
-  };
+  const fmtTimer = (s) => `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
 
-  const handleCloseModal = () => {
-    if (activeHeldSlot) {
-      releaseHeldSlot(activeHeldSlot.date, activeHeldSlot.slotId);
-    }
-    setBookingSlotId(null);
-  };
+  // ── Slot status helpers ───────────────────────────────────────────────────
+  const getSlotForHour = (hour) =>
+    slots.find((s) => parseInt(s.startTime, 10) === hour ||
+                      s.startTime?.startsWith(String(hour).padStart(2,'0') + ':'));
 
-  const handleConfirm = () => {
-    if (activeHeldSlot) {
-      const result = confirmBooking(activeHeldSlot.date, activeHeldSlot.slotId, duration);
-      if (result) {
-        setLastBookingId(result.id);
-        setBookingSuccess(true);
-        setTimeout(() => {
-          setBookingSlotId(null);
-          setBookingSuccess(false);
-        }, 4000);
+  // Which hours in the selected range are problematic
+  const rangeIssues = () => {
+    if (form.startHour === '' || form.endHour === '') return [];
+    const issues = [];
+    for (let h = Number(form.startHour); h < Number(form.endHour); h++) {
+      const slot = getSlotForHour(h);
+      if (slot && slot.status !== 'AVAILABLE') {
+        issues.push({ hour: h, status: slot.status });
       }
     }
+    return issues;
   };
 
-  const selectedSlot = activeSlots.find(s => s.id === bookingSlotId);
-  const priceEstimate = selectedSlot ? Math.round(selectedSlot.price * duration) : 0;
-
-  const formatTime = (seconds) => {
-    const mins = Math.floor(seconds / 60);
-    const secs = seconds % 60;
-    return `${mins}:${String(secs).padStart(2, '0')}`;
+  // Estimated price for the selected range
+  const estimatedPrice = () => {
+    if (form.startHour === '' || form.endHour === '') return 0;
+    let total = 0;
+    for (let h = Number(form.startHour); h < Number(form.endHour); h++) {
+      const slot = getSlotForHour(h);
+      total += slot?.price || 700;
+    }
+    return total;
   };
 
-  // Determine current active step for the progress tracker
-  const getActiveStep = () => {
-    if (bookingSuccess) return 3;
-    if (bookingSlotId !== null) return 2;
-    return 1;
+  // ── Date select helper ───────────────────────────────────────────────────
+  const handleDateSelect = (d) => {
+    setGridDate(d);
+    setForm((f) => ({ ...f, date: d, startHour: '', endHour: '' }));
   };
 
-  // Framer Motion staggered loading configurations
-  const gridVariants = {
-    hidden: { opacity: 0 },
-    show: {
-      opacity: 1,
-      transition: {
-        staggerChildren: 0.03
-      }
+  // ── Open / close modal ────────────────────────────────────────────────────
+  const openModal = (dateToUse) => {
+    if (!user) { showToast('Please sign in to book', 'warning'); navigate('/login'); return; }
+    const targetDate = dateToUse || gridDate || todayStr();
+    setStep('form');
+    setForm((f) => ({
+      ...f,
+      date: targetDate,
+      startHour: f.date === targetDate ? f.startHour : '',
+      endHour: f.date === targetDate ? f.endHour : '',
+      teamName: f.teamName || '',
+      numPlayers: f.numPlayers || '',
+    }));
+    setFormErrors({});
+    setPending(null);
+    setHoldTimer(HOLD_SECS);
+    setShowModal(true);
+  };
+
+  const closeModal = async () => {
+    clearInterval(timerRef.current);
+    if (pendingBooking?.paymentStatus === 'PENDING') {
+      // Cancel & release the hold silently
+      try {
+        const api = (await import('../api/bookings'));
+        // call cancel endpoint if it exists — best-effort
+        await fetch(`http://localhost:8080/api/bookings/${pendingBooking.id}`, {
+          method: 'DELETE',
+          headers: { Authorization: `Bearer ${localStorage.getItem('token')}` },
+        });
+      } catch (_) {}
+    }
+    setShowModal(false);
+    setStep('form');
+    setPending(null);
+    loadSlots();
+  };
+
+  // ── Form submit ───────────────────────────────────────────────────────────
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    const errs = {};
+    if (!form.date)                            errs.date      = 'Date is required';
+    if (form.startHour === '')                 errs.startHour = 'Select a start time';
+    if (form.endHour === '')                   errs.endHour   = 'Select an end time';
+    if (form.endHour !== '' && form.startHour !== '' &&
+        Number(form.endHour) <= Number(form.startHour)) {
+      errs.endHour = 'End time must be after start time';
+    }
+    if (Object.keys(errs).length) { setFormErrors(errs); return; }
+
+    const issues = rangeIssues();
+    if (issues.length > 0) {
+      const h = issues[0];
+      errs.startHour = `⚠️ ${hourLabel(h.hour)} is already ${h.status.toLowerCase()}. Please choose a different time range.`;
+      setFormErrors(errs);
+      return;
+    }
+
+    setFormErrors({});
+    setSubmitting(true);
+    try {
+      const booking = await createBooking({
+        date:       form.date,
+        startHour:  Number(form.startHour),
+        endHour:    Number(form.endHour),
+        teamName:   form.teamName   || undefined,
+        numPlayers: form.numPlayers ? Number(form.numPlayers) : undefined,
+      });
+      setPending(booking);
+      setHoldTimer(HOLD_SECS);
+      setStep('payment');
+    } catch (err) {
+      const msg = err.response?.data?.error || 'Could not hold slots. Please try again.';
+      setFormErrors({ startHour: '⚠️ ' + msg });
+    } finally {
+      setSubmitting(false);
     }
   };
 
-  const cardVariants = {
-    hidden: { y: 12, opacity: 0 },
-    show: { y: 0, opacity: 1, transition: { type: "spring", stiffness: 100 } }
+  // ── WhatsApp Admin Notification Link ─────────────────────────────────────
+  const getAdminWhatsappLink = (b) => {
+    if (b?.adminWhatsappUrl) return b.adminWhatsappUrl;
+    const adminPhone = '916382022478';
+    const text = encodeURIComponent(
+      `*NEW BOOKING ALERT - DD TURF COIMBATORE*\n\n` +
+      `👤 *Customer:* ${b?.userName || user?.name || 'Customer'}\n` +
+      `📱 *Customer Phone:* ${b?.userPhone || user?.phone || 'N/A'}\n` +
+      `🆔 *Booking Ref:* ${b?.bookingReference || ''}\n` +
+      `📅 *Date:* ${b?.date || ''}\n` +
+      `⏰ *Time:* ${fmtTime(b?.startTime)} - ${fmtTime(b?.endTime)} (${b?.duration || 1} hr)\n` +
+      (b?.teamName ? `⚽ *Team:* ${b.teamName}\n` : '') +
+      (b?.numPlayers ? `👥 *Players:* ${b.numPlayers}\n` : '') +
+      `💰 *Total Amount:* ₹${b?.totalAmount || ''}\n` +
+      `✅ *Payment Status:* PAID (Confirmed)\n` +
+      `🏟️ *Pitch:* DD Turf Coimbatore`
+    );
+    return `https://wa.me/${adminPhone}?text=${text}`;
   };
 
+  // ── Payment ───────────────────────────────────────────────────────────────
+  const handlePay = async () => {
+    setPayLoading(true);
+    await new Promise((r) => setTimeout(r, 1800));
+    try {
+      const confirmed = await confirmPayment(pendingBooking.id);
+      clearInterval(timerRef.current);
+      setPending(confirmed);
+      setStep('success');
+      showToast('Booking confirmed! Details sent to Admin 🎉', 'success');
+      loadSlots();
+    } catch (err) {
+      showToast(err.response?.data?.error || 'Payment failed', 'warning');
+    } finally {
+      setPayLoading(false);
+    }
+  };
+
+  // ── Build from/to hour options ────────────────────────────────────────────
+  // Start: 0–23
+  const startHourOptions = Array.from({ length: 24 }, (_, h) => {
+    const slot = getSlotForHour(h);
+    const unavail = slot && slot.status !== 'AVAILABLE';
+    return { h, label: hourLabel(h), unavail };
+  });
+
+  // End: startHour+1 … 24  (end is exclusive upper bound)
+  const endHourOptions = form.startHour !== ''
+    ? Array.from({ length: 24 - Number(form.startHour) }, (_, i) => {
+        const h = Number(form.startHour) + i + 1;
+        return { h, label: hourLabel(h) };
+      })
+    : [];
+
+  // ── Render ────────────────────────────────────────────────────────────────
   return (
-    <motion.div
-      initial={{ opacity: 0, y: 15 }}
-      animate={{ opacity: 1, y: 0 }}
-      exit={{ opacity: 0, y: -15 }}
-      transition={{ duration: 0.35, ease: "easeInOut" }}
-      className="max-w-7xl mx-auto px-4 md:px-8 py-8 relative bg-white min-h-[80vh] text-slate-900"
-    >
-      <div className="absolute top-10 left-1/3 w-[300px] h-[300px] bg-brand/5 rounded-full blur-[100px] pointer-events-none" />
+    <div className="max-w-5xl mx-auto px-4 py-8">
 
-      {/* Booking Steps Progress Tracker */}
-      <div className="max-w-3xl mx-auto mb-8 hidden md:block">
-        <div className="flex items-center justify-between text-xs font-black uppercase tracking-wider text-slate-400 relative">
-          {/* Connector bar */}
-          <div className="absolute top-1/2 left-0 w-full h-0.5 bg-slate-100 -translate-y-1/2 z-0" />
-          <div 
-            className="absolute top-1/2 left-0 h-0.5 bg-brand -translate-y-1/2 z-0 transition-all duration-500" 
-            style={{ width: getActiveStep() === 1 ? '0%' : getActiveStep() === 2 ? '50%' : '100%' }}
-          />
-
-          <div className="z-10 flex flex-col items-center gap-1 bg-white px-4">
-            <span className={`w-6 h-6 rounded-full flex items-center justify-center border font-bold ${
-              getActiveStep() >= 1 ? 'bg-brand text-white border-brand' : 'bg-slate-50 text-slate-400 border-slate-200'
-            }`}>1</span>
-            <span className={getActiveStep() >= 1 ? 'text-brand' : ''}>Choose Session</span>
-          </div>
-
-          <div className="z-10 flex flex-col items-center gap-1 bg-white px-4">
-            <span className={`w-6 h-6 rounded-full flex items-center justify-center border font-bold ${
-              getActiveStep() >= 2 ? 'bg-brand text-white border-brand' : 'bg-slate-50 text-slate-400 border-slate-200'
-            }`}>2</span>
-            <span className={getActiveStep() >= 2 ? 'text-brand' : ''}>Secure Timer Hold</span>
-          </div>
-
-          <div className="z-10 flex flex-col items-center gap-1 bg-white px-4">
-            <span className={`w-6 h-6 rounded-full flex items-center justify-center border font-bold ${
-              getActiveStep() >= 3 ? 'bg-brand text-white border-brand' : 'bg-slate-50 text-slate-400 border-slate-200'
-            }`}>3</span>
-            <span className={getActiveStep() >= 3 ? 'text-brand' : ''}>WhatsApp Dispatch</span>
-          </div>
-        </div>
-      </div>
-
-      {/* Main Header */}
-      <div className="flex flex-col md:flex-row md:items-end justify-between gap-6 mb-8 border-b border-slate-200 pb-6">
+      {/* Header */}
+      <div className="flex items-start justify-between mb-6 gap-4 flex-wrap">
         <div>
-          <span className="text-brand text-xs font-black uppercase tracking-widest flex items-center gap-1.5 leading-none mb-2">
-            <Zap className="w-3.5 h-3.5 fill-current" />
-            Arena Reservation
-          </span>
-          <h2 className="text-5xl font-extrabold text-slate-900 tracking-tight uppercase font-sports leading-none">
-            DD TURF
-          </h2>
-          <div className="flex items-center gap-1 text-slate-500 text-xs font-semibold mt-2.5">
-            <MapPin className="w-3.5 h-3.5 text-brand" />
-            <span>Near MERLIS HOTEL, Avinashi Road, Goldwins, Coimbatore - 641014</span>
-          </div>
+          <h1 className="text-3xl font-black text-slate-800">Book a Slot</h1>
+          <p className="text-slate-500 mt-1 text-sm">
+            The grid shows today's live availability. Click{' '}
+            <span className="font-semibold text-brand">Book Now</span> to select your time range.
+          </p>
         </div>
-
-        {/* Date Selector Strip */}
-        <div className="flex gap-2 bg-slate-50 p-1 rounded-xl border border-slate-200 overflow-x-auto self-start">
-          {dates.slice(0, 5).map((date) => (
-            <button
-              key={date.dateStr}
-              onClick={() => {
-                if (activeHeldSlot) releaseHeldSlot(activeHeldSlot.date, activeHeldSlot.slotId);
-                setSelectedDate(date.dateStr);
-              }}
-              className={`px-4 py-2 rounded-lg text-xs font-extrabold tracking-widest uppercase transition-all flex-shrink-0 cursor-pointer ${
-                selectedDate === date.dateStr
-                  ? 'bg-brand text-white shadow-md'
-                  : 'text-slate-500 hover:text-slate-900 hover:bg-slate-100/50'
-              }`}
-            >
-              {date.dayName} {date.dayNum}
-            </button>
-          ))}
-        </div>
+        <button
+          onClick={openModal}
+          className="flex-shrink-0 px-6 py-3 bg-brand hover:bg-brand-dark text-white font-black
+                     rounded-2xl shadow-lg shadow-brand/20 hover:shadow-brand/40
+                     transition-all hover:scale-[1.03] active:scale-95 text-sm"
+        >
+          ⚽ Book Now
+        </button>
       </div>
 
-      {/* Advanced UI: Interactive Tactical Pitch Selector Map */}
-      <div className="mb-8">
-        <h3 className="text-xs font-black uppercase tracking-wider text-slate-400 mb-3.5">
-          Select Pitch Layout (Coimbatore DD Turf Arena)
-        </h3>
-        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-          {/* Pitch A (5v5) */}
-          <div
-            onClick={() => {
-              if (activeHeldSlot) releaseHeldSlot(activeHeldSlot.date, activeHeldSlot.slotId);
-              setSelectedPitch('pitchA');
-            }}
-            className={`cursor-pointer rounded-2xl border p-5 flex items-center justify-between transition-all duration-300 ${
-              selectedPitch === 'pitchA'
-                ? 'bg-brand/5 border-brand ring-1 ring-brand shadow-md'
-                : 'bg-slate-50 border-slate-200 hover:border-slate-350'
-            }`}
-          >
-            <div>
-              <span className={`inline-block text-[9px] font-black tracking-widest uppercase px-2 py-0.5 rounded-md ${
-                selectedPitch === 'pitchA' ? 'bg-brand text-white' : 'bg-slate-200 text-slate-600'
-              }`}>PITCH A (5v5 Astroturf)</span>
-              <h4 className="text-lg font-extrabold mt-2 font-sports text-slate-900 uppercase">Futsal & 5v5 Court</h4>
-              <p className="text-xs text-slate-500 mt-1 font-semibold">Perfect for quick matches. Rates start from ₹70/hr.</p>
-            </div>
-            {/* Interactive mini-stadium schematic icon */}
-            <div className="w-20 h-12 border-2 border-slate-300 rounded-lg relative overflow-hidden flex-shrink-0 flex items-center justify-center bg-[#047857]/5">
-              <div className="absolute left-1/2 top-0 bottom-0 w-0.5 bg-slate-300 -translate-x-1/2" />
-              <div className="w-5 h-5 rounded-full border-2 border-slate-300 absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2" />
-              {selectedPitch === 'pitchA' && (
-                <div className="absolute inset-0 bg-brand/10 border border-brand flex items-center justify-center text-brand font-black text-xs">ACTIVE</div>
-              )}
-            </div>
-          </div>
-
-          {/* Pitch B (7v7) */}
-          <div
-            onClick={() => {
-              if (activeHeldSlot) releaseHeldSlot(activeHeldSlot.date, activeHeldSlot.slotId);
-              setSelectedPitch('pitchB');
-            }}
-            className={`cursor-pointer rounded-2xl border p-5 flex items-center justify-between transition-all duration-300 ${
-              selectedPitch === 'pitchB'
-                ? 'bg-brand/5 border-brand ring-1 ring-brand shadow-md'
-                : 'bg-slate-50 border-slate-200 hover:border-slate-350'
-            }`}
-          >
-            <div>
-              <span className={`inline-block text-[9px] font-black tracking-widest uppercase px-2 py-0.5 rounded-md ${
-                selectedPitch === 'pitchB' ? 'bg-brand text-white' : 'bg-slate-200 text-slate-600'
-              }`}>PITCH B (7v7 Arena)</span>
-              <h4 className="text-lg font-extrabold mt-2 font-sports text-slate-900 uppercase">Championship Field</h4>
-              <p className="text-xs text-slate-500 mt-1 font-semibold">Sideline benches & high fencing. Rates start from ₹90/hr.</p>
-            </div>
-            {/* Interactive mini-stadium schematic icon */}
-            <div className="w-20 h-12 border-2 border-slate-300 rounded-lg relative overflow-hidden flex-shrink-0 flex items-center justify-center bg-[#047857]/5">
-              <div className="absolute left-1/2 top-0 bottom-0 w-0.5 bg-slate-300 -translate-x-1/2" />
-              <div className="w-5 h-5 rounded-full border-2 border-slate-300 absolute left-1/2 top-1/2 -translate-x-1/2 -translate-y-1/2" />
-              {selectedPitch === 'pitchB' && (
-                <div className="absolute inset-0 bg-brand/10 border border-brand flex items-center justify-center text-brand font-black text-xs">ACTIVE</div>
-              )}
-            </div>
-          </div>
-        </div>
-      </div>
-
-      {/* Time Slot Grid with Staggered Load Animation */}
-      <h3 className="text-sm font-black uppercase tracking-wider text-slate-400 mb-3.5">
-        Select Hourly Session ({dates.find(d => d.dateStr === selectedDate)?.dayName}, {dates.find(d => d.dateStr === selectedDate)?.monthName} {dates.find(d => d.dateStr === selectedDate)?.dayNum})
-      </h3>
-      <motion.div 
-        variants={gridVariants}
-        initial="hidden"
-        animate="show"
-        key={`${selectedDate}-${selectedPitch}`} // Re-triggers animations when date or pitch is toggled!
-        className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6 gap-4"
-      >
-        {activeSlots.map((slot) => {
-          const isAvailable = slot.status === 'available';
-          const isBooked = slot.status === 'booked';
-          const isHeld = slot.status === 'held';
-          const isBlocked = slot.status === 'blocked';
-          
-          let cardStyle = '';
-          let textStyle = '';
-          let badgeText = 'Available';
-          let badgeStyle = '';
-
-          if (isAvailable) {
-            cardStyle = 'bg-white border-slate-200 text-slate-900 shadow-sm hover:border-brand hover:bg-brand/5 hover:scale-[1.01]';
-            textStyle = 'text-slate-900 font-extrabold';
-            badgeText = 'Available';
-            badgeStyle = 'text-emerald-600 bg-emerald-50 border-emerald-200';
-          } else if (isBooked) {
-            cardStyle = 'bg-slate-50 border-slate-150 opacity-60 booked-stripes cursor-not-allowed';
-            textStyle = 'text-slate-400 line-through';
-            badgeText = 'Sold Out';
-            badgeStyle = 'text-slate-55 bg-slate-100 border-slate-250';
-          } else if (isHeld) {
-            const isMe = slot.heldBy === 'me';
-            cardStyle = isMe 
-              ? 'bg-brand border-brand text-white glow-red animate-pulse' 
-              : 'bg-slate-50 border-slate-150 opacity-75 cursor-not-allowed';
-            textStyle = isMe ? 'text-white font-black' : 'text-slate-400';
-            badgeText = isMe ? 'Hold Active' : 'Lock Held';
-            badgeStyle = isMe 
-              ? 'text-white bg-red-800/40 border-red-500/50'
-              : 'text-amber-600 bg-amber-50 border-amber-200';
-          } else if (isBlocked) {
-            cardStyle = 'bg-slate-100 border-slate-200 opacity-40 cursor-not-allowed';
-            textStyle = 'text-slate-400';
-            badgeText = 'Blocked';
-            badgeStyle = 'text-slate-500 bg-slate-200 border-slate-350';
-          }
-
+      {/* Date selector */}
+      <div className="flex gap-2 overflow-x-auto pb-1 mb-5">
+        {getDates(7).map((d) => {
+          const dt    = new Date(d + 'T00:00:00');
+          const day   = dt.toLocaleDateString('en-IN', { weekday: 'short' });
+          const num   = dt.getDate();
+          const month = dt.toLocaleDateString('en-IN', { month: 'short' });
           return (
-            <motion.div
-              key={slot.id}
-              variants={cardVariants}
-              onClick={() => !isBooked && !isBlocked && !isHeld && handleSlotClick(slot)}
-              whileTap={isAvailable ? { scale: 0.96 } : {}}
-              className={`p-5 rounded-xl border flex flex-col justify-between h-36 transition-all duration-200 ${cardStyle}`}
-            >
-              <div>
-                <span className={`inline-flex items-center text-[9px] font-extrabold uppercase px-2 py-0.5 rounded-full border ${badgeStyle}`}>
-                  {badgeText}
-                </span>
-                <h3 className={`text-2xl font-sports mt-3 ${textStyle}`}>{slot.time}</h3>
-              </div>
-              <div className="flex justify-between items-center mt-3 text-xs font-bold text-slate-500">
-                <span className="opacity-75">{selectedPitch === 'pitchA' ? '5v5 Astroturf' : '7v7 Arena'}</span>
-                <span className="text-slate-800">₹{slot.price}/hr</span>
-              </div>
-            </motion.div>
+            <button key={d} onClick={() => handleDateSelect(d)}
+              className={`flex-shrink-0 flex flex-col items-center px-4 py-3 rounded-2xl border-2 transition-all
+                ${gridDate === d ? 'bg-brand border-brand text-white shadow-md shadow-brand/20' : 'bg-white border-slate-200 text-slate-600 hover:border-brand/50'}`}>
+              <span className="text-xs font-semibold">{day}</span>
+              <span className="text-xl font-black">{num}</span>
+              <span className="text-xs">{month}</span>
+            </button>
           );
         })}
-      </motion.div>
+      </div>
 
-      {/* Sticky Bottom Active Hold Bar */}
-      <AnimatePresence>
-        {activeHeldSlot && !bookingSlotId && (
-          <motion.div
-            initial={{ y: 80, opacity: 0 }}
-            animate={{ y: 0, opacity: 1 }}
-            exit={{ y: 80, opacity: 0 }}
-            className="fixed bottom-6 left-1/2 -translate-x-1/2 z-40 max-w-lg w-[calc(100%-2rem)] bg-white border border-brand/35 p-4 rounded-xl shadow-xl flex items-center justify-between gap-4"
-          >
-            <div className="flex items-center gap-3">
-              <div className="w-10 h-10 rounded-xl bg-brand/10 border border-brand/20 flex items-center justify-center text-brand animate-pulse">
-                <Timer className="w-5 h-5" />
-              </div>
-              <div>
-                <p className="text-xs text-slate-500 font-bold uppercase leading-none mb-1">Checkout Lock Active</p>
-                <p className="text-sm font-extrabold text-slate-900">
-                  Secured for {formatTime(holdTimer)}
-                </p>
-              </div>
-            </div>
-            
-            <button
-              onClick={() => setBookingSlotId(activeHeldSlot.slotId)}
-              className="bg-brand hover:bg-brand-dark text-white font-black text-xs uppercase px-5 py-2.5 rounded-lg shadow-lg shadow-brand/20 transition-all flex items-center gap-1.5 cursor-pointer"
-            >
-              Complete Booking
-              <ArrowRight className="w-3.5 h-3.5" />
-            </button>
-          </motion.div>
-        )}
-      </AnimatePresence>
+      {/* Legend */}
+      <div className="flex gap-5 mb-4 flex-wrap">
+        {Object.entries(STATUS_CONFIG).map(([s, cfg]) => (
+          <div key={s} className="flex items-center gap-1.5 text-xs text-slate-500">
+            <span className={`w-2.5 h-2.5 rounded-full ${cfg.dot}`} />
+            {cfg.label}
+          </div>
+        ))}
+        <span className="text-xs text-slate-400 ml-auto flex items-center gap-1">
+          <span className="w-2 h-2 bg-emerald-400 rounded-full animate-pulse" /> Live
+        </span>
+      </div>
 
-      {/* Booking Flow Modal */}
+      {/* Slot grid — VIEW ONLY */}
+      {loadingSlots ? (
+        <div className="grid grid-cols-4 sm:grid-cols-6 md:grid-cols-8 gap-2">
+          {Array(24).fill(0).map((_, i) => <div key={i} className="h-16 bg-slate-100 rounded-xl animate-pulse" />)}
+        </div>
+      ) : (
+        <div className="grid grid-cols-4 sm:grid-cols-6 md:grid-cols-8 gap-2">
+          {slots.map((slot, i) => {
+            const cfg = STATUS_CONFIG[slot.status] || STATUS_CONFIG.AVAILABLE;
+            const isAvail = slot.status === 'AVAILABLE';
+            return (
+              <motion.div key={slot.id}
+                initial={{ opacity: 0, scale: 0.9 }}
+                animate={{ opacity: 1, scale: 1 }}
+                transition={{ delay: i * 0.012 }}
+                onClick={() => {
+                  if (isAvail) {
+                    const startH = parseInt(slot.startTime.split(':')[0], 10);
+                    setForm((f) => ({
+                      ...f,
+                      date: gridDate,
+                      startHour: startH,
+                      endHour: startH + 1,
+                    }));
+                    openModal(gridDate);
+                  }
+                }}
+                title={isAvail ? `Click to book ${fmtTime(slot.startTime)}` : `${fmtTime(slot.startTime)} — ${cfg.label}`}
+                className={`${cfg.bg} ${cfg.border} border-2 rounded-xl p-2 text-center select-none transition-all
+                  ${isAvail ? 'cursor-pointer hover:border-emerald-400 hover:scale-105 active:scale-95 hover:shadow-md' : ''}`}
+              >
+                <span className={`inline-block w-2 h-2 rounded-full ${cfg.dot} mb-1`} />
+                <div className="text-xs font-bold text-slate-700">{fmtTime(slot.startTime)}</div>
+                <div className={`text-[10px] font-semibold ${cfg.text}`}>{cfg.label}</div>
+                <div className="text-[10px] text-slate-400">₹{slot.price}</div>
+              </motion.div>
+            );
+          })}
+        </div>
+      )}
+
+      {/* ── MODAL ── */}
       <AnimatePresence>
-        {bookingSlotId && selectedSlot && (
-          <div className="fixed inset-0 z-50 flex items-center justify-center px-4">
+        {showModal && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center p-4 overflow-y-auto">
             <motion.div
+              key="bd"
               initial={{ opacity: 0 }}
               animate={{ opacity: 1 }}
               exit={{ opacity: 0 }}
-              onClick={handleCloseModal}
-              className="absolute inset-0 bg-slate-900/40 backdrop-filter backdrop-blur-sm"
+              onClick={closeModal}
+              className="fixed inset-0 bg-black/60 backdrop-blur-sm"
             />
 
             <motion.div
-              initial={{ scale: 0.9, opacity: 0, y: 20 }}
-              animate={{ scale: 1, opacity: 1, y: 0 }}
-              exit={{ scale: 0.95, opacity: 0, y: 15 }}
-              className="relative w-full max-w-md bg-white border border-slate-200 rounded-2xl shadow-2xl overflow-hidden p-6 md:p-8 z-10 text-slate-900"
+              key="modal"
+              initial={{ opacity: 0, scale: 0.95, y: 20 }}
+              animate={{ opacity: 1, scale: 1, y: 0 }}
+              exit={{ opacity: 0, scale: 0.95, y: 20 }}
+              transition={{ type: 'spring', damping: 26, stiffness: 300 }}
+              className="relative w-full max-w-[520px] bg-white rounded-3xl shadow-2xl z-10 max-h-[90vh] overflow-y-auto my-auto"
             >
-              {/* Confetti Explosion */}
-              {bookingSuccess && (
-                <div className="absolute inset-0 overflow-hidden pointer-events-none z-50">
-                  {[...Array(24)].map((_, i) => {
-                    const angle = (i / 24) * 360;
-                    const velocity = 85;
-                    const rad = (angle * Math.PI) / 180;
-                    const xDest = Math.cos(rad) * velocity;
-                    const yDest = Math.sin(rad) * velocity;
 
-                    return (
-                      <motion.div
-                        key={i}
-                        initial={{ x: "0%", y: "0%", scale: 1, rotate: 0 }}
-                        animate={{ 
-                          x: `${xDest}px`, 
-                          y: `${yDest}px`, 
-                          scale: 0, 
-                          rotate: 360,
-                          opacity: [1, 1, 0]
-                        }}
-                        transition={{ duration: 1.5, ease: 'easeOut' }}
-                        className="absolute left-1/2 top-1/2 w-3.5 h-3.5 rounded-full"
-                        style={{
-                          backgroundColor: ['#e30613', '#ff4d4d', '#0f172a', '#64748b', '#cbd5e1'][i % 5]
-                        }}
+              {/* ── FORM ── */}
+              {step === 'form' && (
+                <div className="p-6">
+                  <div className="flex items-center justify-between mb-6">
+                    <div>
+                      <h2 className="text-xl font-black text-slate-800">Book Your Slot</h2>
+                      <p className="text-sm text-slate-400 mt-0.5">Choose date, from time & to time</p>
+                    </div>
+                    <button onClick={closeModal}
+                      className="w-9 h-9 bg-slate-100 hover:bg-slate-200 rounded-xl flex items-center justify-center transition-all">
+                      <X size={17} className="text-slate-500" />
+                    </button>
+                  </div>
+
+                  <form onSubmit={handleSubmit} className="space-y-5">
+
+                    {/* Date */}
+                    <FField label="Date" error={formErrors.date}>
+                      <div className="relative">
+                        <Calendar size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" />
+                        <input type="date" value={form.date} min={todayStr()}
+                          onChange={(e) => {
+                            const newDate = e.target.value;
+                            setForm((f) => ({ ...f, date: newDate, startHour: '', endHour: '' }));
+                            setGridDate(newDate);
+                          }}
+                          className="w-full pl-9 pr-4 py-3 border border-slate-200 rounded-xl text-sm
+                                     bg-slate-50 focus:bg-white focus:outline-none focus:ring-2 focus:ring-brand/30 focus:border-brand transition-all" />
+                      </div>
+                    </FField>
+
+                    {/* From – To time row */}
+                    <div className="grid grid-cols-2 gap-3">
+                      <FField label="From" error={formErrors.startHour}>
+                        <div className="relative">
+                          <Clock size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400 z-10" />
+                          <select value={form.startHour}
+                            onChange={(e) => setForm((f) => ({ ...f, startHour: e.target.value, endHour: '' }))}
+                            className="w-full pl-9 pr-3 py-3 border border-slate-200 rounded-xl text-sm
+                                       bg-slate-50 focus:bg-white focus:outline-none focus:ring-2 focus:ring-brand/30 focus:border-brand appearance-none transition-all">
+                            <option value="">Start time</option>
+                            {startHourOptions.map(({ h, label, unavail }) => (
+                              <option key={h} value={h} disabled={unavail}>
+                                {label}{unavail ? ' ✗' : ''}
+                              </option>
+                            ))}
+                          </select>
+                          <ChevronDown size={13} className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 pointer-events-none" />
+                        </div>
+                      </FField>
+
+                      <FField label="To" error={formErrors.endHour}>
+                        <div className="relative">
+                          <Clock size={14} className="absolute left-3 top-1/2 -translate-y-1/2 text-slate-400 z-10" />
+                          <select value={form.endHour}
+                            onChange={(e) => setForm((f) => ({ ...f, endHour: e.target.value }))}
+                            disabled={form.startHour === ''}
+                            className="w-full pl-9 pr-3 py-3 border border-slate-200 rounded-xl text-sm
+                                       bg-slate-50 focus:bg-white focus:outline-none focus:ring-2 focus:ring-brand/30 focus:border-brand appearance-none transition-all
+                                       disabled:opacity-50 disabled:cursor-not-allowed">
+                            <option value="">End time</option>
+                            {endHourOptions.map(({ h, label }) => (
+                              <option key={h} value={h}>{label}</option>
+                            ))}
+                          </select>
+                          <ChevronDown size={13} className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 pointer-events-none" />
+                        </div>
+                      </FField>
+                    </div>
+
+                    {/* Live range preview */}
+                    {form.startHour !== '' && form.endHour !== '' && Number(form.endHour) > Number(form.startHour) && (
+                      <RangePreview
+                        startHour={Number(form.startHour)}
+                        endHour={Number(form.endHour)}
+                        slots={slots}
+                        estimatedPrice={estimatedPrice()}
+                        issues={rangeIssues()}
                       />
-                    );
-                  })}
+                    )}
+
+                    {/* Team & players */}
+                    <div className="grid grid-cols-2 gap-3">
+                      <FField label={<>Team <span className="text-slate-400 font-normal text-xs">(opt)</span></>}>
+                        <input type="text" value={form.teamName} placeholder="FC Chennai"
+                          onChange={(e) => setForm((f) => ({ ...f, teamName: e.target.value }))}
+                          className="w-full px-4 py-3 border border-slate-200 rounded-xl text-sm bg-slate-50 focus:bg-white focus:outline-none focus:ring-2 focus:ring-brand/30 focus:border-brand transition-all" />
+                      </FField>
+                      <FField label={<>Players <span className="text-slate-400 font-normal text-xs">(opt)</span></>}>
+                        <input type="number" min="1" max="22" value={form.numPlayers} placeholder="10"
+                          onChange={(e) => setForm((f) => ({ ...f, numPlayers: e.target.value }))}
+                          className="w-full px-4 py-3 border border-slate-200 rounded-xl text-sm bg-slate-50 focus:bg-white focus:outline-none focus:ring-2 focus:ring-brand/30 focus:border-brand transition-all" />
+                      </FField>
+                    </div>
+
+                    <button type="submit" disabled={submitting || rangeIssues().length > 0}
+                      className="w-full py-3.5 bg-brand hover:bg-brand-dark text-white rounded-2xl font-black text-sm
+                                 shadow-md transition-all disabled:opacity-60 flex items-center justify-center gap-2">
+                      {submitting
+                        ? <><span className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" /> Securing slots...</>
+                        : 'Confirm & Proceed to Payment →'}
+                    </button>
+                  </form>
                 </div>
               )}
 
-              {!bookingSuccess && (
-                <button
-                  onClick={handleCloseModal}
-                  className="absolute top-5 right-5 text-slate-400 hover:text-slate-700 p-1 hover:bg-slate-50 rounded-lg transition-all cursor-pointer"
-                >
-                  <X className="w-5 h-5" />
-                </button>
+              {/* ── PAYMENT ── */}
+              {step === 'payment' && pendingBooking && (
+                <div className="p-6">
+                  <div className="flex items-center justify-between mb-5">
+                    <h2 className="text-xl font-black text-slate-800">Complete Payment</h2>
+                    <button onClick={closeModal}
+                      className="w-9 h-9 bg-slate-100 hover:bg-slate-200 rounded-xl flex items-center justify-center">
+                      <X size={17} className="text-slate-500" />
+                    </button>
+                  </div>
+
+                  {/* Hold timer */}
+                  <div className={`flex items-center gap-2 p-3 rounded-2xl mb-5 text-sm font-semibold
+                    ${holdTimer < 60 ? 'bg-red-50 text-red-600 border border-red-200' : 'bg-amber-50 text-amber-700 border border-amber-200'}`}>
+                    <Timer size={15} />
+                    Slots held for{' '}
+                    <span className="font-black text-base">{fmtTimer(holdTimer)}</span>
+                    {' '}— pay before they're released
+                  </div>
+
+                  {/* Order summary */}
+                  <div className="bg-slate-50 rounded-2xl p-4 mb-5 space-y-2 text-sm border border-slate-200">
+                    <Row label="Date"     val={pendingBooking.date} />
+                    <Row label="From"     val={fmtTime(pendingBooking.startTime)} />
+                    <Row label="To"       val={fmtTime(pendingBooking.endTime)} />
+                    <Row label="Duration" val={`${pendingBooking.duration} hour(s)`} />
+                    {pendingBooking.teamName && <Row label="Team" val={pendingBooking.teamName} />}
+                    <div className="border-t border-slate-200 pt-2 flex justify-between font-black text-base">
+                      <span>Total</span><span className="text-brand">₹{pendingBooking.totalAmount}</span>
+                    </div>
+                  </div>
+
+                  {/* Payment method */}
+                  <div className="mb-5">
+                    <p className="text-sm font-semibold text-slate-600 mb-2">Payment Method</p>
+                    <div className="flex gap-3 mb-4">
+                      {[['upi',<Smartphone size={15}/>,'UPI'],['card',<CreditCard size={15}/>,'Card']].map(([m,icon,label])=>(
+                        <button key={m} onClick={() => setPayMethod(m)}
+                          className={`flex-1 flex items-center gap-2 justify-center py-3 rounded-xl border-2 text-sm font-semibold transition-all
+                            ${payMethod === m ? 'bg-brand border-brand text-white' : 'border-slate-200 text-slate-600 hover:border-brand/50'}`}>
+                          {icon}{label}
+                        </button>
+                      ))}
+                    </div>
+                    {payMethod === 'upi'
+                      ? <input placeholder="yourname@upi" className="w-full px-4 py-3 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-brand/30" />
+                      : <div className="space-y-3">
+                          <input placeholder="1234 5678 9012 3456" className="w-full px-4 py-3 border border-slate-200 rounded-xl text-sm focus:outline-none" />
+                          <div className="flex gap-3">
+                            <input placeholder="MM/YY" className="flex-1 px-4 py-3 border border-slate-200 rounded-xl text-sm" />
+                            <input placeholder="CVV"   className="flex-1 px-4 py-3 border border-slate-200 rounded-xl text-sm" />
+                          </div>
+                        </div>
+                    }
+                  </div>
+
+                  <button onClick={handlePay} disabled={payLoading}
+                    className="w-full py-3.5 bg-brand hover:bg-brand-dark text-white rounded-2xl font-black text-sm
+                               shadow-md flex items-center justify-center gap-2 disabled:opacity-60 transition-all">
+                    {payLoading
+                      ? <><span className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" /> Processing...</>
+                      : <><Shield size={15}/> Pay ₹{pendingBooking.totalAmount} Securely</>}
+                  </button>
+                </div>
               )}
 
-              {bookingSuccess ? (
-                <div className="text-center py-6 flex flex-col items-center">
-                  <motion.div
-                    initial={{ scale: 0.3, opacity: 0 }}
-                    animate={{ scale: 1, opacity: 1 }}
-                    transition={{ type: 'spring', damping: 10, stiffness: 100 }}
-                    className="w-16 h-16 rounded-full bg-brand flex items-center justify-center mb-6 glow-red border-2 border-white shadow-md"
-                  >
-                    <Check className="w-8 h-8 text-white stroke-[3px]" />
-                  </motion.div>
-                  
-                  <h3 className="text-2xl font-black text-slate-955 uppercase tracking-tight font-sports">Reservation Secured!</h3>
-                  <p className="text-xs text-brand mt-1 font-extrabold uppercase">Booking ID: {lastBookingId}</p>
-                  
-                  <div className="bg-slate-50 border border-slate-200 rounded-2xl p-5 w-full my-6 text-left space-y-3">
-                    <div className="flex justify-between items-center text-sm border-b border-slate-200 pb-2.5">
-                      <span className="text-slate-500 font-bold">Turf Location</span>
-                      <span className="text-slate-900 font-extrabold">DD Turf, Coimbatore</span>
+              {/* ── SUCCESS ── */}
+              {step === 'success' && pendingBooking && (
+                <div className="p-6 text-center">
+                  {/* Confetti */}
+                  <div className="relative flex justify-center h-20 mb-2">
+                    {Array.from({ length: 14 }).map((_, i) => (
+                      <motion.div key={i}
+                        initial={{ opacity: 1, x: 0, y: 0, scale: 1 }}
+                        animate={{ opacity: 0, x: (i%2===0?1:-1)*(20+i*9), y: -50-i*4, scale: 0 }}
+                        transition={{ duration: 0.8, delay: i * 0.04 }}
+                        className="absolute w-2.5 h-2.5 rounded-full top-5"
+                        style={{ background: ['#e30613','#22c55e','#3b82f6','#f59e0b'][i%4] }}
+                      />
+                    ))}
+                    <div className="w-16 h-16 bg-emerald-100 rounded-full flex items-center justify-center z-10">
+                      <CheckCircle size={34} className="text-emerald-500" />
                     </div>
-                    <div className="flex justify-between items-center text-sm border-b border-slate-200 pb-2.5">
-                      <span className="text-slate-500 font-bold">Pitch Layout</span>
-                      <span className="text-slate-900 font-extrabold">
-                        {selectedPitch === 'pitchA' ? 'Pitch A (5v5 astroturf)' : 'Pitch B (7v7 arena)'}
+                  </div>
+
+                  <h2 className="text-2xl font-black text-slate-800 mb-1">Booking Confirmed!</h2>
+                  <p className="text-slate-500 text-sm mb-4">Payment received & slot reserved successfully 🎉</p>
+
+                  <div className="bg-slate-50 rounded-2xl p-4 text-left mb-4 space-y-2 text-sm border border-slate-200">
+                    <Row label="Booking ID" val={pendingBooking.bookingReference} />
+                    <Row label="Date"       val={pendingBooking.date} />
+                    <Row label="From"       val={fmtTime(pendingBooking.startTime)} />
+                    <Row label="To"         val={fmtTime(pendingBooking.endTime)} />
+                    <Row label="Duration"   val={`${pendingBooking.duration} hr`} />
+                    <Row label="Amount"     val={`₹${pendingBooking.totalAmount}`} />
+                  </div>
+
+                  {/* Automatic Admin WhatsApp Status Card */}
+                  <div className="bg-emerald-50 border border-emerald-300 rounded-2xl p-4 mb-5 text-left shadow-sm">
+                    <div className="flex items-center justify-between mb-1.5">
+                      <div className="flex items-center gap-2">
+                        <span className="w-7 h-7 rounded-lg bg-emerald-600 text-white flex items-center justify-center font-bold text-xs shadow">
+                          ✓
+                        </span>
+                        <span className="font-extrabold text-sm text-emerald-950">Automated Admin WhatsApp Sent</span>
+                      </div>
+                      <span className="text-[10px] font-extrabold bg-emerald-200 text-emerald-900 px-2 py-0.5 rounded-full">
+                        +91 6382022478
                       </span>
                     </div>
-                    <div className="flex justify-between items-center text-sm border-b border-slate-200 pb-2.5">
-                      <span className="text-slate-500 font-bold">Session Time</span>
-                      <span className="text-slate-900 font-extrabold">{selectedSlot.time} ({duration === 1 ? '1 Hr' : duration === 1.5 ? '1.5 Hrs' : '2 Hrs'})</span>
-                    </div>
-                    <div className="flex justify-between items-center text-sm">
-                      <span className="text-slate-500 font-bold">Amount Paid</span>
-                      <span className="text-brand font-black font-sports text-lg">₹{priceEstimate}</span>
-                    </div>
+                    <p className="text-xs text-slate-600 mb-2">
+                      Booking details and slot timings have been automatically routed to the DD Turf administrator via WhatsApp.
+                    </p>
+                    <a
+                      href={getAdminWhatsappLink(pendingBooking)}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="text-xs text-emerald-700 hover:text-emerald-900 font-bold underline inline-flex items-center gap-1"
+                    >
+                      💬 View formatted receipt or chat with Admin
+                    </a>
                   </div>
 
-                  <div className="bg-red-50/80 border border-red-200 text-brand text-xs py-3 px-4 rounded-xl flex items-center gap-3 w-full justify-center">
-                    <span className="font-bold text-center">
-                      ✅ Booking confirmed! Receipts dispatched to athlete WhatsApp.
-                    </span>
-                  </div>
-                </div>
-              ) : (
-                <div>
-                  <div className="flex items-center gap-2.5 mb-6 text-brand">
-                    <Timer className="w-5 h-5 animate-pulse" />
-                    <span className="text-xs font-bold uppercase tracking-widest text-brand">
-                      Redis Hold Locked: {formatTime(holdTimer)}
-                    </span>
-                  </div>
-
-                  <h3 className="text-2xl font-black text-slate-900 uppercase tracking-tight font-sports">Confirm Reservation</h3>
-                  <p className="text-xs text-slate-500 font-bold mt-1">Configure your match options to complete booking.</p>
-
-                  <div className="space-y-5 mt-6">
-                    <div className="bg-slate-50 rounded-xl p-4 flex justify-between items-center border border-slate-200">
-                      <div>
-                        <span className="text-[10px] text-slate-400 font-bold uppercase">Time Slot</span>
-                        <p className="text-sm font-extrabold text-slate-800 mt-0.5">{selectedSlot.time}</p>
-                      </div>
-                      <div className="text-right">
-                        <span className="text-[10px] text-slate-400 font-bold uppercase">Hourly Price</span>
-                        <p className="text-sm font-extrabold text-brand mt-0.5">₹{selectedSlot.price}/hr</p>
-                      </div>
-                    </div>
-
-                    <div>
-                      <label className="block text-xs font-bold uppercase tracking-wider text-slate-500 mb-2">
-                        Match Duration
-                      </label>
-                      <div className="flex gap-2">
-                        {[1, 1.5, 2].map((dur) => (
-                          <button
-                            key={dur}
-                            onClick={() => setDuration(dur)}
-                            className={`flex-1 py-2.5 rounded-lg text-xs font-extrabold uppercase border transition-all cursor-pointer ${
-                              duration === dur
-                                ? 'bg-brand border-brand text-white font-black'
-                                : 'bg-slate-50 border-slate-200 text-slate-600 hover:text-slate-800'
-                            }`}
-                          >
-                            {dur === 1 ? '1 Hr' : dur === 1.5 ? '1.5 Hrs' : '2 Hrs'}
-                          </button>
-                        ))}
-                      </div>
-                    </div>
-
-                    <div className="border-t border-slate-200 pt-4 flex justify-between items-center">
-                      <div>
-                        <p className="text-sm font-bold text-slate-800">Estimated Cost</p>
-                        <p className="text-[10px] text-slate-400 font-semibold">Includes service fees & tax</p>
-                      </div>
-                      <div className="text-right">
-                        <p className="text-3xl font-black text-brand font-sports">₹{priceEstimate}</p>
-                      </div>
-                    </div>
-
-                    <div className="flex gap-3 pt-3">
-                      <button
-                        onClick={handleCloseModal}
-                        className="flex-1 bg-slate-50 hover:bg-slate-100 text-slate-700 font-bold text-sm py-3.5 rounded-lg border border-slate-200 transition-all cursor-pointer"
-                      >
-                        Cancel
-                      </button>
-                      <button
-                        onClick={handleConfirm}
-                        className="flex-1 bg-brand hover:bg-brand-dark text-white font-black text-sm py-3.5 rounded-lg shadow-md shadow-brand/10 transition-all hover:scale-[1.01] active:scale-[0.98] cursor-pointer"
-                      >
-                        Book Now
-                      </button>
-                    </div>
+                  <div className="flex gap-3">
+                    <button onClick={closeModal}
+                      className="flex-1 py-3 border-2 border-brand text-brand rounded-xl font-bold text-sm hover:bg-brand/5 transition-all">
+                      Book Another
+                    </button>
+                    <button onClick={() => { closeModal(); navigate('/bookings'); }}
+                      className="flex-1 py-3 bg-brand text-white rounded-xl font-bold text-sm hover:bg-brand-dark shadow-md transition-all">
+                      My Bookings →
+                    </button>
                   </div>
                 </div>
               )}
+
             </motion.div>
           </div>
         )}
       </AnimatePresence>
-    </motion.div>
+    </div>
+  );
+}
+
+// ── Range preview card ────────────────────────────────────────────────────────
+function RangePreview({ startHour, endHour, slots, estimatedPrice, issues }) {
+  const hours = Array.from({ length: endHour - startHour }, (_, i) => startHour + i);
+  return (
+    <div className={`rounded-2xl p-4 border-2 ${issues.length > 0 ? 'bg-red-50 border-red-200' : 'bg-brand/5 border-brand/20'}`}>
+      <div className="flex justify-between items-start mb-3">
+        <div>
+          <p className="text-sm font-bold text-slate-700">
+            {hourLabel(startHour)} → {hourLabel(endHour)}
+          </p>
+          <p className="text-xs text-slate-500">{endHour - startHour} hour(s)</p>
+        </div>
+        <div className="text-right">
+          <p className="text-lg font-black text-brand">₹{estimatedPrice}</p>
+          <p className="text-xs text-slate-400">estimated</p>
+        </div>
+      </div>
+
+      {/* Mini slot strip */}
+      <div className="flex gap-1 flex-wrap">
+        {hours.map((h) => {
+          const slot = slots.find((s) => s.startTime?.startsWith(String(h).padStart(2,'0') + ':'));
+          const status = slot?.status || 'AVAILABLE';
+          const cfg = {
+            AVAILABLE: 'bg-emerald-200 text-emerald-800',
+            HELD:      'bg-amber-200 text-amber-800',
+            BOOKED:    'bg-red-200 text-red-800',
+            BLOCKED:   'bg-slate-200 text-slate-600',
+          }[status] || 'bg-emerald-200';
+          return (
+            <span key={h} className={`px-2 py-0.5 rounded-lg text-[10px] font-bold ${cfg}`}>
+              {hourLabel(h).replace(':00', '')}
+            </span>
+          );
+        })}
+      </div>
+
+      {issues.length > 0 && (
+        <div className="mt-2 flex items-start gap-1.5 text-xs text-red-600">
+          <AlertCircle size={12} className="mt-0.5 flex-shrink-0" />
+          <span>{hourLabel(issues[0].hour)} is {issues[0].status.toLowerCase()}. Choose a different range.</span>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
+function FField({ label, error, children }) {
+  return (
+    <div>
+      <label className="block text-sm font-semibold text-slate-700 mb-1.5">{label}</label>
+      {children}
+      {error && (
+        <div className="flex items-start gap-1 mt-1.5">
+          <AlertCircle size={12} className="text-red-500 mt-0.5 flex-shrink-0" />
+          <p className="text-xs text-red-500 leading-snug">{error}</p>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function Row({ label, val }) {
+  return (
+    <div className="flex justify-between">
+      <span className="text-slate-500">{label}</span>
+      <span className="font-semibold text-slate-800">{val}</span>
+    </div>
   );
 }

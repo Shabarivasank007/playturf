@@ -1,7 +1,8 @@
-import React, { useState, useRef } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { motion, AnimatePresence, useScroll, useTransform } from 'framer-motion';
-import { Zap, Calendar, ArrowRight, ShieldCheck, Trophy, Sparkles, Award, MapPin, Grid, Camera, ChevronDown, Check, Clock, Eye } from 'lucide-react';
+import { Zap, Calendar, ArrowRight, ShieldCheck, Trophy, Sparkles, Award, MapPin, Grid, Camera, ChevronDown, Check, Clock, Eye, Activity } from 'lucide-react';
+import { fetchSlots } from '../api/slots';
 
 const pitchesData = [
   {
@@ -245,79 +246,8 @@ export default function Home() {
         </motion.div>
       </div>
 
-      {/* Advanced UI: Live Slot Occupancy & Quick Launcher Widget */}
-      <div className="relative z-30 bg-slate-50 border-b border-slate-200 py-10 px-4 md:px-8">
-        <div className="max-w-7xl mx-auto grid grid-cols-1 lg:grid-cols-3 gap-8 items-center">
-          
-          {/* Left panel: Circular stats */}
-          <div className="bg-white p-6 rounded-2xl border border-slate-200 flex items-center gap-5 shadow-sm">
-            <div className="relative w-20 h-20 flex-shrink-0">
-              <svg className="w-full h-full transform -rotate-90" viewBox="0 0 36 36">
-                <path
-                  className="text-slate-100"
-                  strokeWidth="3.5"
-                  stroke="currentColor"
-                  fill="none"
-                  d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831"
-                />
-                <motion.path
-                  className="text-brand"
-                  strokeDasharray="75, 100"
-                  strokeWidth="3.5"
-                  strokeLinecap="round"
-                  stroke="currentColor"
-                  fill="none"
-                  d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831"
-                  initial={{ strokeDasharray: "0, 100" }}
-                  animate={{ strokeDasharray: "75, 100" }}
-                  transition={{ duration: 1.2, ease: "easeOut" }}
-                />
-              </svg>
-              <div className="absolute inset-0 flex items-center justify-center font-sports text-xl font-black text-slate-800">
-                75%
-              </div>
-            </div>
-            <div>
-              <span className="text-[10px] text-brand font-black uppercase tracking-widest">Live Capacity</span>
-              <h4 className="text-base font-extrabold text-slate-900 mt-0.5 leading-none">Pitches Occupied Today</h4>
-              <p className="text-xs text-slate-500 font-semibold mt-1.5">12 of 16 reservation blocks secured.</p>
-            </div>
-          </div>
-
-          {/* Right panel: Quick Booking Launchers */}
-          <div className="lg:col-span-2 bg-white p-6 rounded-2xl border border-slate-200 shadow-sm flex flex-col md:flex-row md:items-center justify-between gap-5">
-            <div className="max-w-md">
-              <span className="text-slate-400 text-[10px] font-black uppercase tracking-widest">Quick checkout Launcher</span>
-              <h3 className="text-lg font-extrabold text-slate-900 mt-0.5 leading-none">Immediate Available Slots</h3>
-              <p className="text-xs text-slate-500 font-semibold mt-1.5">Click any open session block below to lock the pitch instantly.</p>
-            </div>
-            
-            <div className="flex flex-wrap gap-2.5">
-              <button 
-                onClick={handleBookNow} 
-                className="bg-slate-50 border border-slate-200 hover:border-brand px-3.5 py-2.5 rounded-xl text-left hover:bg-brand/5 group transition-all cursor-pointer flex items-center gap-3"
-              >
-                <Clock className="w-4 h-4 text-emerald-600" />
-                <div>
-                  <p className="text-xs font-black text-slate-800 leading-none">06:00 PM</p>
-                  <span className="text-[9px] text-emerald-600 font-bold uppercase mt-0.5 block group-hover:underline">Pitch A (5v5)</span>
-                </div>
-              </button>
-              <button 
-                onClick={handleBookNow} 
-                className="bg-slate-50 border border-slate-200 hover:border-brand px-3.5 py-2.5 rounded-xl text-left hover:bg-brand/5 group transition-all cursor-pointer flex items-center gap-3"
-              >
-                <Clock className="w-4 h-4 text-emerald-600" />
-                <div>
-                  <p className="text-xs font-black text-slate-800 leading-none">08:00 PM</p>
-                  <span className="text-[9px] text-emerald-600 font-bold uppercase mt-0.5 block group-hover:underline">Pitch B (7v7)</span>
-                </div>
-              </button>
-            </div>
-          </div>
-
-        </div>
-      </div>
+      {/* Live Slot Occupancy Widget — real API data */}
+      <LiveSlotWidget onBookNow={handleBookNow} />
 
       {/* Section 2: BookMyShow-style Arena Pitch Categories with 3D Hover Tilt */}
       <div className="relative z-30 bg-white py-16 px-4 md:px-8">
@@ -564,5 +494,91 @@ export default function Home() {
       </div>
 
     </motion.div>
+  );
+}
+
+// ── LiveSlotWidget — fetches real data from the backend ──────────────────────
+function LiveSlotWidget({ onBookNow }) {
+  const [slots, setSlots] = useState([]);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    const today = new Date().toISOString().split('T')[0];
+    fetchSlots(today)
+      .then(setSlots)
+      .catch(() => {})
+      .finally(() => setLoading(false));
+  }, []);
+
+  const total     = slots.length;
+  const booked    = slots.filter((s) => s.status === 'BOOKED' || s.status === 'HELD').length;
+  const pct       = total ? Math.round((booked / total) * 100) : 0;
+  const available = slots.filter((s) => s.status === 'AVAILABLE').slice(0, 4);
+
+  return (
+    <div className="relative z-30 bg-slate-50 border-b border-slate-200 py-10 px-4 md:px-8">
+      <div className="max-w-7xl mx-auto grid grid-cols-1 lg:grid-cols-3 gap-8 items-center">
+
+        {/* Circular gauge */}
+        <div className="bg-white p-6 rounded-2xl border border-slate-200 flex items-center gap-5 shadow-sm">
+          <div className="relative w-20 h-20 flex-shrink-0">
+            <svg className="w-full h-full transform -rotate-90" viewBox="0 0 36 36">
+              <path className="text-slate-100" strokeWidth="3.5" stroke="currentColor" fill="none"
+                d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831" />
+              <motion.path className="text-brand" strokeWidth="3.5" strokeLinecap="round"
+                stroke="currentColor" fill="none"
+                d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831"
+                initial={{ strokeDasharray: "0, 100" }}
+                animate={{ strokeDasharray: `${pct}, 100` }}
+                transition={{ duration: 1.2, ease: "easeOut" }}
+              />
+            </svg>
+            <div className="absolute inset-0 flex items-center justify-center text-xl font-black text-slate-800">
+              {loading ? '—' : `${pct}%`}
+            </div>
+          </div>
+          <div>
+            <span className="text-[10px] text-brand font-black uppercase tracking-widest flex items-center gap-1">
+              <Activity size={10} /> Live Capacity
+            </span>
+            <h4 className="text-base font-extrabold text-slate-900 mt-0.5 leading-none">Slots Taken Today</h4>
+            <p className="text-xs text-slate-500 font-semibold mt-1.5">
+              {loading ? 'Loading…' : `${booked} of ${total} slots occupied`}
+            </p>
+          </div>
+        </div>
+
+        {/* Quick launchers */}
+        <div className="lg:col-span-2 bg-white p-6 rounded-2xl border border-slate-200 shadow-sm flex flex-col md:flex-row md:items-center justify-between gap-5">
+          <div className="max-w-md">
+            <span className="text-slate-400 text-[10px] font-black uppercase tracking-widest">Quick Launcher</span>
+            <h3 className="text-lg font-extrabold text-slate-900 mt-0.5 leading-none">Available Right Now</h3>
+            <p className="text-xs text-slate-500 font-semibold mt-1.5">
+              {loading ? 'Fetching slots…' : `${slots.filter(s=>s.status==='AVAILABLE').length} slots open today — click to book instantly`}
+            </p>
+          </div>
+
+          <div className="flex flex-wrap gap-2.5">
+            {loading ? (
+              [1,2,3].map((i) => <div key={i} className="w-24 h-12 bg-slate-100 rounded-xl animate-pulse" />)
+            ) : available.length > 0 ? (
+              available.map((slot) => (
+                <button key={slot.id} onClick={onBookNow}
+                  className="bg-slate-50 border border-slate-200 hover:border-brand px-3.5 py-2.5 rounded-xl text-left hover:bg-brand/5 group transition-all flex items-center gap-3">
+                  <Clock className="w-4 h-4 text-emerald-600" />
+                  <div>
+                    <p className="text-xs font-black text-slate-800 leading-none">{slot.startTime?.slice(0,5)}</p>
+                    <span className="text-[9px] text-emerald-600 font-bold uppercase mt-0.5 block">₹{slot.price}/hr</span>
+                  </div>
+                </button>
+              ))
+            ) : (
+              <span className="text-sm text-slate-500">No available slots — check another date</span>
+            )}
+          </div>
+        </div>
+
+      </div>
+    </div>
   );
 }

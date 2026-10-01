@@ -1,211 +1,232 @@
-import React, { useState } from 'react';
-import { useApp } from '../context/AppContext';
+import { useState, useEffect, useCallback } from 'react';
 import { motion } from 'framer-motion';
-import { ShieldCheck, BarChart3, Settings, Users, Calendar, Power, AlertCircle, Wrench } from 'lucide-react';
+import { BarChart2, Calendar, Users, Lock, Unlock, RefreshCw, Filter } from 'lucide-react';
+import { fetchAllBookings, fetchBookingsByDate, toggleBlockSlot, generateSlots } from '../api/admin';
+import { fetchSlots } from '../api/slots';
+import { useApp } from '../context/AppContext';
+import { useSlotSocket } from '../hooks/useSlotSocket';
+
+function today() { return new Date().toISOString().split('T')[0]; }
 
 export default function Admin() {
-  const { dates, slots, selectedDate, setSelectedDate, toggleBlockSlot } = useApp();
-  
-  // Calculate summary metrics for today
-  const activeDateSlots = slots[selectedDate] || [];
-  
-  const bookedCount = activeDateSlots.filter(s => s.status === 'booked').length;
-  const heldCount = activeDateSlots.filter(s => s.status === 'held').length;
-  const blockedCount = activeDateSlots.filter(s => s.status === 'blocked').length;
-  const availableCount = activeDateSlots.filter(s => s.status === 'available').length;
+  const { showToast } = useApp();
+  const [activeTab, setActiveTab] = useState('bookings'); // bookings | slots
+  const [bookings, setBookings]   = useState([]);
+  const [slots, setSlots]         = useState([]);
+  const [dateFilter, setDateFilter] = useState(today());
+  const [loading, setLoading]     = useState(false);
+  const [slotLoading, setSlotLoading] = useState(false);
 
-  const estimatedRevenue = activeDateSlots
-    .filter(s => s.status === 'booked')
-    .reduce((sum, s) => sum + s.price, 0);
+  // ── Load bookings ────────────────────────────────────────────────────────────
+  const loadBookings = useCallback(async () => {
+    setLoading(true);
+    try {
+      const data = dateFilter
+        ? await fetchBookingsByDate(dateFilter)
+        : await fetchAllBookings();
+      setBookings(data);
+    } catch { showToast('Failed to load bookings', 'warning'); }
+    finally { setLoading(false); }
+  }, [dateFilter]);
+
+  // ── Load slots ───────────────────────────────────────────────────────────────
+  const loadSlots = useCallback(async () => {
+    setSlotLoading(true);
+    try {
+      setSlots(await fetchSlots(dateFilter));
+    } finally { setSlotLoading(false); }
+  }, [dateFilter]);
+
+  useEffect(() => { loadBookings(); loadSlots(); }, [loadBookings, loadSlots]);
+
+  useSlotSocket(dateFilter, (updated) => {
+    setSlots((prev) => prev.map((s) => s.id === updated.id ? updated : s));
+  });
+
+  // ── Stats ────────────────────────────────────────────────────────────────────
+  const revenue  = bookings.filter((b) => b.paymentStatus === 'PAID')
+                           .reduce((s, b) => s + b.totalAmount, 0);
+  const paid     = bookings.filter((b) => b.paymentStatus === 'PAID').length;
+  const pending  = bookings.filter((b) => b.paymentStatus === 'PENDING').length;
+  const bookedSl = slots.filter((s) => s.status === 'BOOKED').length;
+  const heldSl   = slots.filter((s) => s.status === 'HELD').length;
+  const util     = slots.length ? Math.round(((bookedSl + heldSl) / slots.length) * 100) : 0;
+
+  // ── Toggle block ─────────────────────────────────────────────────────────────
+  const handleToggle = async (slotId) => {
+    try {
+      const updated = await toggleBlockSlot(slotId);
+      setSlots((prev) => prev.map((s) => s.id === updated.id ? updated : s));
+      showToast(`Slot ${updated.status === 'BLOCKED' ? 'blocked' : 'unblocked'}`, 'info');
+    } catch (err) {
+      showToast(err.response?.data?.error || 'Failed', 'warning');
+    }
+  };
+
+  const handleGenerate = async () => {
+    try {
+      await generateSlots(7);
+      showToast('Slots generated for next 7 days', 'success');
+    } catch { showToast('Generation failed', 'warning'); }
+  };
 
   return (
-    <motion.div
-      initial={{ opacity: 0, y: 15 }}
-      animate={{ opacity: 1, y: 0 }}
-      exit={{ opacity: 0, y: -15 }}
-      transition={{ duration: 0.35, ease: "easeInOut" }}
-      className="max-w-7xl mx-auto px-4 md:px-8 py-10 relative bg-white min-h-[85vh] text-slate-900"
-    >
-      <div className="absolute top-10 left-1/4 w-[400px] h-[400px] bg-brand/5 rounded-full blur-[100px] pointer-events-none" />
-
+    <div className="max-w-6xl mx-auto px-4 py-8">
       {/* Header */}
-      <div className="flex flex-col md:flex-row md:items-center justify-between gap-6 mb-10 border-b border-slate-200 pb-6">
+      <div className="flex items-center justify-between mb-8">
         <div>
-          <span className="text-brand text-xs font-black uppercase tracking-widest flex items-center gap-1.5 animate-pulse">
-            <ShieldCheck className="w-4 h-4 text-brand" />
-            Security Level: Owner Dashboard
-          </span>
-          <h1 className="text-4xl font-extrabold text-slate-900 tracking-tight uppercase mt-1 font-sports">
-            Arena Manager Console
-          </h1>
-          <p className="text-slate-500 mt-2 text-sm font-semibold">
-            Control slots status, declare pitch maintenance, and audit real-time bookings.
-          </p>
+          <h1 className="text-3xl font-black text-slate-800">Admin Panel</h1>
+          <p className="text-slate-500 mt-1">DD Turf Control Centre</p>
         </div>
-
-        {/* Date Selector */}
-        <div className="flex gap-2 bg-slate-50 p-1.5 rounded-xl border border-slate-200 overflow-x-auto self-start">
-          {dates.map((date) => (
-            <button
-              key={date.dateStr}
-              onClick={() => setSelectedDate(date.dateStr)}
-              className={`px-4 py-2 rounded-lg text-xs font-extrabold tracking-widest uppercase transition-all flex-shrink-0 cursor-pointer ${
-                selectedDate === date.dateStr
-                  ? 'bg-brand text-white shadow-md'
-                  : 'text-slate-500 hover:text-slate-900 hover:bg-slate-100/50'
-              }`}
-            >
-              {date.dayName} {date.dayNum}
-            </button>
-          ))}
-        </div>
+        <button onClick={handleGenerate}
+          className="flex items-center gap-2 px-4 py-2 bg-brand text-white rounded-2xl text-sm font-bold hover:bg-brand-dark transition-all">
+          <RefreshCw size={14} /> Generate Slots
+        </button>
       </div>
 
-      {/* Summary Metrics */}
-      <div className="grid grid-cols-2 lg:grid-cols-4 gap-5 mb-8">
-        
-        <div className="bg-slate-50 border border-slate-200 p-5 rounded-xl shadow-sm">
-          <p className="text-xs text-slate-500 font-extrabold uppercase">Today's Revenue</p>
-          <h3 className="text-2xl font-black text-brand mt-1 font-sports">₹{estimatedRevenue}</h3>
-          <p className="text-[10px] text-slate-400 font-bold uppercase mt-1">From active booked slots</p>
-        </div>
-
-        <div className="bg-slate-50 border border-slate-200 p-5 rounded-xl shadow-sm">
-          <p className="text-xs text-slate-500 font-extrabold uppercase">Confirmed Bookings</p>
-          <h3 className="text-2xl font-black text-slate-900 mt-1 font-sports">{bookedCount} Slots</h3>
-          <p className="text-[10px] text-brand mt-1 font-extrabold uppercase">{Math.round((bookedCount / activeDateSlots.length) * 100)}% utilization</p>
-        </div>
-
-        <div className="bg-slate-50 border border-slate-200 p-5 rounded-xl shadow-sm">
-          <p className="text-xs text-slate-500 font-extrabold uppercase">Held/In Checkout</p>
-          <h3 className="text-2xl font-black text-amber-600 mt-1 font-sports">{heldCount} Slots</h3>
-          <p className="text-[10px] text-slate-400 font-bold uppercase mt-1">Temporary Redis holds</p>
-        </div>
-
-        <div className="bg-slate-50 border border-slate-200 p-5 rounded-xl shadow-sm">
-          <p className="text-xs text-slate-500 font-extrabold uppercase">Under Maintenance</p>
-          <h3 className="text-2xl font-black text-red-500 mt-1 font-sports">{blockedCount} Slots</h3>
-          <p className="text-[10px] text-slate-400 font-bold uppercase mt-1">Blocked on user scheduler</p>
-        </div>
-
+      {/* Stats */}
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 mb-8">
+        <Stat label="Revenue" val={`₹${revenue}`} color="text-brand" />
+        <Stat label="Paid Bookings" val={paid} color="text-emerald-600" />
+        <Stat label="Utilization" val={`${util}%`} color="text-blue-600" />
+        <Stat label="Pending" val={pending} color="text-amber-600" />
       </div>
 
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
-        
-        {/* Slot Administration Panel */}
-        <div className="lg:col-span-2 space-y-6">
-          <div className="bg-slate-50 p-6 rounded-2xl border border-slate-200 shadow-sm">
-            <div className="flex items-center justify-between mb-6 border-b border-slate-200 pb-4">
-              <div className="flex items-center gap-2">
-                <Wrench className="w-5 h-5 text-brand" />
-                <h2 className="text-xl font-extrabold text-slate-900 uppercase tracking-tight font-sports">
-                  Slot Controls Grid
-                </h2>
+      {/* Date filter */}
+      <div className="flex items-center gap-3 mb-6">
+        <Filter size={16} className="text-slate-400" />
+        <input type="date" value={dateFilter} onChange={(e) => setDateFilter(e.target.value)}
+          className="px-4 py-2 border border-slate-200 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-brand/30" />
+        <button onClick={() => { loadBookings(); loadSlots(); }}
+          className="px-4 py-2 bg-slate-100 hover:bg-slate-200 rounded-xl text-sm font-semibold text-slate-600 transition-all">
+          Refresh
+        </button>
+      </div>
+
+      {/* Tabs */}
+      <div className="flex bg-slate-100 rounded-2xl p-1 mb-6 w-fit">
+        {['bookings','slots'].map((t) => (
+          <button key={t} onClick={() => setActiveTab(t)}
+            className={`px-5 py-2 rounded-xl text-sm font-semibold transition-all capitalize
+              ${activeTab === t ? 'bg-white text-brand shadow-sm' : 'text-slate-500 hover:text-slate-700'}`}>
+            {t}
+          </button>
+        ))}
+      </div>
+
+      {/* Bookings table */}
+      {activeTab === 'bookings' && (
+        loading ? <Skeleton n={5} /> : (
+          <div className="bg-white border border-slate-200 rounded-3xl overflow-hidden">
+            {bookings.length === 0 ? (
+              <div className="p-10 text-center text-slate-400">No bookings for this date</div>
+            ) : (
+              <div className="overflow-x-auto">
+                <table className="w-full text-sm">
+                  <thead className="bg-slate-50 border-b border-slate-200">
+                    <tr>{['Ref','Name','Phone','Email','Date','Time','Dur','Team','Status','Amount'].map(h=>(
+                      <th key={h} className="px-4 py-3 text-left text-xs font-bold text-slate-500 uppercase tracking-wide">{h}</th>
+                    ))}</tr>
+                  </thead>
+                  <tbody>
+                    {bookings.map((b, i) => (
+                      <tr key={b.id} className={`border-b border-slate-100 hover:bg-slate-50 ${i % 2 === 0 ? '' : 'bg-slate-50/40'}`}>
+                        <td className="px-4 py-3 font-mono text-xs text-slate-600">{b.bookingReference}</td>
+                        <td className="px-4 py-3 font-semibold text-slate-800">{b.userName}</td>
+                        <td className="px-4 py-3 text-slate-600">
+                          <div className="flex items-center gap-1.5">
+                            <span>{b.userPhone || '—'}</span>
+                            {b.userPhone && (
+                              <a
+                                href={`https://wa.me/${b.userPhone.replace(/\D/g,'').startsWith('91') ? b.userPhone.replace(/\D/g,'') : '91' + b.userPhone.replace(/\D/g,'')}?text=${encodeURIComponent(`Hi ${b.userName}, regarding your DD Turf booking ${b.bookingReference} on ${b.date}:`)}`}
+                                target="_blank"
+                                rel="noopener noreferrer"
+                                title="WhatsApp Customer"
+                                className="text-emerald-600 hover:text-emerald-700 bg-emerald-50 hover:bg-emerald-100 p-1 rounded-md text-xs font-bold inline-flex items-center"
+                              >
+                                💬
+                              </a>
+                            )}
+                          </div>
+                        </td>
+                        <td className="px-4 py-3 text-slate-500 text-xs">{b.userEmail}</td>
+                        <td className="px-4 py-3 text-slate-600">{b.date}</td>
+                        <td className="px-4 py-3 text-slate-600">{b.startTime?.slice(0,5)}</td>
+                        <td className="px-4 py-3">{b.duration}h</td>
+                        <td className="px-4 py-3 text-slate-500">{b.teamName || '—'}</td>
+                        <td className="px-4 py-3">
+                          <span className={`px-2 py-0.5 rounded-full text-xs font-bold
+                            ${b.paymentStatus === 'PAID' ? 'bg-emerald-100 text-emerald-700' :
+                              b.paymentStatus === 'PENDING' ? 'bg-amber-100 text-amber-700' :
+                              'bg-red-100 text-red-600'}`}>
+                            {b.paymentStatus}
+                          </span>
+                        </td>
+                        <td className="px-4 py-3 font-bold text-brand">₹{b.totalAmount}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
               </div>
-              <span className="text-xs text-slate-500 font-semibold">Click slots to block for maintenance</span>
-            </div>
-
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-3.5">
-              {activeDateSlots.map((slot) => {
-                const isBlocked = slot.status === 'blocked';
-                const isBooked = slot.status === 'booked';
-                const isHeld = slot.status === 'held';
-
-                let cardStyle = '';
-                let statusStyle = '';
-
-                if (isBlocked) {
-                  cardStyle = 'bg-red-50 border-red-200 text-red-800';
-                  statusStyle = 'text-red-600';
-                } else if (isBooked) {
-                  cardStyle = 'bg-white border-slate-200 text-slate-400 font-bold opacity-60';
-                  statusStyle = 'text-slate-500';
-                } else if (isHeld) {
-                  cardStyle = 'bg-amber-50 border-amber-200 text-amber-800';
-                  statusStyle = 'text-amber-600';
-                } else {
-                  cardStyle = 'bg-white border-slate-200 text-slate-700 hover:border-slate-300';
-                  statusStyle = 'text-emerald-600';
-                }
-
-                return (
-                  <div
-                    key={slot.id}
-                    className={`flex items-center justify-between p-4 rounded-xl border transition-all ${cardStyle}`}
-                  >
-                    <div>
-                      <p className="text-sm font-extrabold text-slate-900">{slot.time}</p>
-                      <p className="text-[10px] font-extrabold uppercase text-slate-400 mt-0.5 leading-none">
-                        Status: <span className={`font-black ${statusStyle}`}>{slot.status}</span>
-                      </p>
-                    </div>
-
-                    <button
-                      onClick={() => toggleBlockSlot(selectedDate, slot.id)}
-                      disabled={isBooked || isHeld}
-                      className={`p-2.5 rounded-lg border transition-all flex items-center justify-center cursor-pointer ${
-                        isBooked || isHeld
-                          ? 'opacity-20 cursor-not-allowed border-slate-200 bg-transparent text-slate-300'
-                          : isBlocked
-                          ? 'bg-red-500 text-white border-red-600 hover:bg-red-600'
-                          : 'bg-white border-slate-200 text-slate-600 hover:bg-slate-100 hover:text-brand hover:border-brand/40'
-                      }`}
-                      title={isBlocked ? 'Unblock Slot' : 'Block Slot'}
-                    >
-                      <Power className="w-4 h-4" />
-                    </button>
-                  </div>
-                );
-              })}
-            </div>
+            )}
           </div>
-        </div>
+        )
+      )}
 
-        {/* Dashboard Bookings List Audit */}
-        <div className="lg:col-span-1 space-y-6">
-          <div className="bg-slate-50 p-6 rounded-2xl border border-slate-200 shadow-sm">
-            <div className="flex items-center gap-2 mb-6 border-b border-slate-200 pb-4">
-              <Users className="w-5 h-5 text-brand" />
-              <h2 className="text-xl font-extrabold text-slate-900 uppercase tracking-tight font-sports">
-                Activity Audit
-              </h2>
-            </div>
-
-            <div className="space-y-4 max-h-[500px] overflow-y-auto pr-1">
-              {activeDateSlots.filter(s => s.status === 'booked' || s.status === 'held').length === 0 ? (
-                <div className="text-center py-10">
-                  <AlertCircle className="w-8 h-8 text-slate-300 mx-auto mb-2" />
-                  <p className="text-xs text-slate-400 font-bold uppercase">No reservations recorded.</p>
+      {/* Slots grid */}
+      {activeTab === 'slots' && (
+        slotLoading ? <Skeleton n={4} /> : (
+          <div className="grid grid-cols-3 sm:grid-cols-6 gap-3">
+            {slots.map((slot) => (
+              <motion.div key={slot.id}
+                whileHover={{ scale: 1.02 }}
+                className={`rounded-2xl border-2 p-3 text-center
+                  ${slot.status === 'BOOKED' ? 'bg-slate-100 border-slate-200' :
+                    slot.status === 'HELD'   ? 'bg-amber-50 border-amber-200' :
+                    slot.status === 'BLOCKED'? 'bg-red-50 border-red-200' :
+                    'bg-white border-slate-200'}`}
+              >
+                <div className="text-sm font-bold text-slate-700">{slot.startTime?.slice(0,5)}</div>
+                <div className={`text-xs mt-1 font-semibold
+                  ${slot.status === 'BOOKED' ? 'text-slate-500' :
+                    slot.status === 'HELD'   ? 'text-amber-600' :
+                    slot.status === 'BLOCKED'? 'text-red-500' :
+                    'text-emerald-600'}`}>
+                  {slot.status}
                 </div>
-              ) : (
-                activeDateSlots
-                  .filter(s => s.status === 'booked' || s.status === 'held')
-                  .map((slot) => (
-                    <div
-                      key={slot.id}
-                      className="p-3.5 rounded-xl bg-white border border-slate-200 flex justify-between items-center text-sm shadow-sm"
-                    >
-                      <div>
-                        <p className="font-extrabold text-slate-900">{slot.time}</p>
-                        <p className="text-xs text-slate-500 font-semibold mt-0.5">
-                          {slot.status === 'booked' ? `Booked by ${slot.bookedBy}` : 'Held by anonymous'}
-                        </p>
-                      </div>
-                      <span className={`text-[9px] font-black uppercase tracking-wider px-2 py-0.5 rounded-lg border ${
-                        slot.status === 'booked' 
-                          ? 'bg-brand/10 text-brand border-brand/20' 
-                          : 'bg-amber-500/10 text-amber-600 border border-amber-500/20'
-                      }`}>
-                        {slot.status}
-                      </span>
-                    </div>
-                  ))
-              )}
-            </div>
-          </div>
-        </div>
+                <div className="text-xs text-slate-400 mt-0.5">₹{slot.price}</div>
 
-      </div>
-    </motion.div>
+                {(slot.status === 'AVAILABLE' || slot.status === 'BLOCKED') && (
+                  <button onClick={() => handleToggle(slot.id)}
+                    className={`mt-2 w-full py-1 rounded-lg text-xs font-bold transition-all
+                      ${slot.status === 'BLOCKED'
+                        ? 'bg-emerald-100 text-emerald-700 hover:bg-emerald-200'
+                        : 'bg-red-100 text-red-600 hover:bg-red-200'}`}>
+                    {slot.status === 'BLOCKED' ? <><Unlock size={10} className="inline mr-1"/>Unblock</> : <><Lock size={10} className="inline mr-1"/>Block</>}
+                  </button>
+                )}
+              </motion.div>
+            ))}
+          </div>
+        )
+      )}
+    </div>
+  );
+}
+
+function Stat({ label, val, color }) {
+  return (
+    <div className="bg-white border border-slate-200 rounded-2xl p-4">
+      <div className={`text-2xl font-black ${color}`}>{val}</div>
+      <div className="text-xs text-slate-500 font-semibold mt-1">{label}</div>
+    </div>
+  );
+}
+
+function Skeleton({ n }) {
+  return (
+    <div className="space-y-3">
+      {Array(n).fill(0).map((_, i) => <div key={i} className="h-12 bg-slate-100 rounded-2xl animate-pulse" />)}
+    </div>
   );
 }
